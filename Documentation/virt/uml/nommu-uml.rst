@@ -30,6 +30,27 @@ called under nommu/UML environment.
   works.
 - return to userspace
 
+When users enable the zpoline syscall hook (configured with boot
+parameter ``zpoline=1``), the code path looks like below;
+
+- boot kernel, setup zpoline trampoline code (detailed later) at address 0x0
+- (userspace starts)
+- calls ``vfork``/``execve`` syscalls
+- during execve, more specifically during ``load_elf_fdpic_binary()``
+  function, kernel translates ``syscall``/``sysenter`` instructions with ``call
+  *%rax``, which usually point to address 0 to ``NR_syscalls`` (around
+  512), where trampoline code was installed during startup.
+- when syscalls are issued by userspace, it jumps to ``*%rax``, slides
+  until ``nop`` instructions end, and jump to hooked function,
+  ``__kernel_vsyscall``, which is an entrypoint for syscall under nommu
+  UML environment.
+- call handler function in ``sys_call_table[]`` and follow how UML syscall
+  works.
+- return to userspace
+
+With zpoline syscall hook, the latency is greatly improved while
+startup time of a process cost a bit.  See more detail in the
+Benchmark section.
 
 What are the differences from MMU-full UML ?
 ============================================
@@ -42,7 +63,9 @@ MMU-full UML doesn't have:
   - generic implementation of memcpy/strcpy/futex is also used
 - alternate syscall entrypoint without ptrace
 - alternate syscall hook
-  - hook syscall by seccomp filter
+  - hook syscall by seccomp filter (when zpoline isn't used)
+  - translation of ``syscall``/``sysenter`` instructions to a trampoline
+    code and syscall hooks (when zpoline is used)
 
 With those modifications, it allows us to use unmodified userspace
 binaries with nommu UML.
@@ -128,23 +151,27 @@ lmbench and (self-crafted) getpid benchmark (with v6.13-rc5 uml/next
 tree).
 
 .. csv-table:: lmbench (usec)
-  :header: ,native,um,um-nommu(s)
+  :header: ,native,um,um-nommu(s),um-nommu(z)
 
-  select-10    ,0.5569,27.0149,2.9772
-  select-100   ,2.3964,26.9242,3.8947
-  select-1000  ,20.8101,39.6842,12.8161
-  syscall      ,0.1735,25.7706,2.6997
-  read         ,0.3488,25.7922,2.7923
-  write        ,0.2861,26.5560,2.7961
-  stat         ,1.9171,36.2893,3.2678
-  open/close   ,3.8475,62.2847,6.3909
-  fork+sh      ,1159.0000,5230.3333,409.1786
-  fork+execve  ,535.3000,2075.8333,135.4074
+  select-10    ,0.5569,27.0149,2.9772,0.3812
+  select-100   ,2.3964,26.9242,3.8947,1.2770
+  select-1000  ,20.8101,39.6842,12.8161,10.1459
+  syscall      ,0.1735,25.7706,2.6997,0.1861
+  read         ,0.3488,25.7922,2.7923,0.2393
+  write        ,0.2861,26.5560,2.7961,0.2415
+  stat         ,1.9171,36.2893,3.2678,0.5617
+  open/close   ,3.8475,62.2847,6.3909,0.9622
+  fork+sh      ,1159.0000,5230.3333,409.1786,18274.0000
+  fork+execve  ,535.3000,2075.8333,135.4074,4718.6667
 
 .. csv-table:: do_getpid bench (nsec)
-  :header: ,native,um,um-nommu(s)
+  :header: ,native,um,um-nommu(s),um-nommu(z)
 
-  getpid, 172 , 24979 , 2691
+  getpid , 172 , 24979 , 2691, 190
+
+
+(um-nommu(z) is nommu with zpoline syscall hook, um-nommu(s) is with
+seccomp syscall hook, respectively)
 
 Limitations
 ===========
@@ -164,10 +191,33 @@ implementation inherits the characteristics of other nommu kernels
 Thus, we have limited options to userspace programs.  We have tested
 Alpine Linux with musl-libc, which has a support nommu kernel.
 
+access to mmap_min_addr (if zpoline enabled)
+--------------------------------------------
+As the mechanism of syscall translations relies on an ability to
+write/read memory address zero (0x0), we need to configure host kernel
+with the following command::
+
+% sh -c "echo 0 > /proc/sys/vm/mmap_min_addr"
+
 supported architecture
 ----------------------
 The current implementation of nommu UML only works on x86_64 SUBARCH.
 We have not tested with 32-bit environment.
+
+target of syscall translation (if zpoline enabled)
+--------------------------------------------------
+The syscall translation only applies to the executable and interpreter
+of ELF binary files which are processed by execve(2) syscall for the
+moment: other libraries such as linked library and dlopen-ed one
+aren't translated; we may be able to trigger the translation by
+LD_PRELOAD.  JIT compiler generated code is also generated after execve
+thus, it is not currently translated.
+
+Note that with musl-libc in Alpine Linux which we've been tested, most
+of syscalls are implemented in the interpreter file
+(ld-musl-x86_64.so) and calling syscall/sysenter instructions from the
+linked/loaded libraries might be rare.  But it is definitely possible
+so, a workaround with LD_PRELOAD is effective.
 
 
 Further readings about NOMMU UML
@@ -175,3 +225,6 @@ Further readings about NOMMU UML
 
 - NOMMU UML (original code by Ricardo Koller)
  - https://static.sched.com/hosted_files/ossna2020/ec/kollerr_linux_um_nommu.pdf
+
+- zpoline: syscall translation mechanism
+ - https://www.usenix.org/conference/atc23/presentation/yasukata
